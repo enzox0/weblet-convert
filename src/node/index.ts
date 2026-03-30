@@ -268,8 +268,64 @@ async function withTempDir<T>(fn: (dir: string) => Promise<T>): Promise<T> {
 }
 
 function getFfmpegPath(): string {
-  if (!ffmpegPath) throw new Error("ffmpeg binary not found (ffmpeg-static did not resolve a path).")
+  if (!ffmpegPath) {
+    throw new Error(
+      "ffmpeg binary not found (ffmpeg-static did not resolve a path). Install optional platform dependencies or provide a runtime where ffmpeg-static can resolve."
+    )
+  }
   return ffmpegPath
+}
+
+function formatArgs(args: string[]): string {
+  return args.map((v) => (/\s/.test(v) ? `"${v}"` : v)).join(" ")
+}
+
+function getExecErrorText(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message
+  try {
+    return JSON.stringify(err)
+  } catch {
+    return String(err)
+  }
+}
+
+function getLikelyMissingVp9Encoder(errText: string): boolean {
+  const lower = errText.toLowerCase()
+  return lower.includes("unknown encoder") || lower.includes("libvpx-vp9") || lower.includes("error initializing output stream")
+}
+
+function buildVideoArgs(
+  inPath: string,
+  outPath: string,
+  opts: Required<Pick<VideoToWebmOptions, "crf" | "deadline" | "returnFile">> & Pick<VideoToWebmOptions, "maxDurationSeconds">,
+  codec: "vp9" | "vp8"
+): string[] {
+  const args: string[] = [
+    "-hide_banner",
+    "-y",
+    ...(opts.maxDurationSeconds && opts.maxDurationSeconds > 0
+      ? ["-t", String(opts.maxDurationSeconds)]
+      : []),
+    "-i",
+    inPath,
+    "-map",
+    "0:v:0",
+    "-map",
+    "0:a?",
+    "-c:v",
+    codec === "vp9" ? "libvpx-vp9" : "libvpx",
+    "-b:v",
+    "0",
+    "-crf",
+    String(opts.crf),
+    "-deadline",
+    opts.deadline,
+    ...(codec === "vp9" ? ["-row-mt", "1"] : []),
+    "-c:a",
+    "libopus",
+    outPath,
+  ]
+  return args
 }
 
 /**
@@ -289,34 +345,39 @@ export async function videoToWebm(
     const outPath = join(dir, "output.webm")
     await writeFileFs(inPath, bytes)
 
-    const args: string[] = [
-      "-hide_banner",
-      "-y",
-      ...(opts.maxDurationSeconds && opts.maxDurationSeconds > 0
-        ? ["-t", String(opts.maxDurationSeconds)]
-        : []),
-      "-i",
-      inPath,
-      "-map",
-      "0:v:0",
-      "-map",
-      "0:a?",
-      "-c:v",
-      "libvpx-vp9",
-      "-b:v",
-      "0",
-      "-crf",
-      String(opts.crf),
-      "-deadline",
-      opts.deadline,
-      "-row-mt",
-      "1",
-      "-c:a",
-      "libopus",
-      outPath,
-    ]
+    const vp9Args = buildVideoArgs(inPath, outPath, opts, "vp9")
 
-    await execa(ffmpeg, args, { stderr: "pipe", stdout: "pipe" })
+    try {
+      await execa(ffmpeg, vp9Args, { stderr: "pipe", stdout: "pipe" })
+    } catch (err) {
+      const execError = getExecErrorText(err)
+      if (!getLikelyMissingVp9Encoder(execError)) {
+        throw new Error(
+          [
+            "videoToWebm failed with VP9 encode.",
+            `ffmpeg=${ffmpeg}`,
+            `args=${formatArgs(vp9Args)}`,
+            `error=${execError}`,
+          ].join("\n")
+        )
+      }
+
+      const vp8Args = buildVideoArgs(inPath, outPath, opts, "vp8")
+      try {
+        await execa(ffmpeg, vp8Args, { stderr: "pipe", stdout: "pipe" })
+      } catch (fallbackErr) {
+        throw new Error(
+          [
+            "videoToWebm failed with VP9 and VP8 fallback.",
+            `ffmpeg=${ffmpeg}`,
+            `vp9_args=${formatArgs(vp9Args)}`,
+            `vp9_error=${execError}`,
+            `vp8_args=${formatArgs(vp8Args)}`,
+            `vp8_error=${getExecErrorText(fallbackErr)}`,
+          ].join("\n")
+        )
+      }
+    }
 
     const out = await readFile(outPath)
     const outBytes = new Uint8Array(out)

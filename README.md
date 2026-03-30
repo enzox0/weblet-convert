@@ -101,6 +101,17 @@ Transcodes videos to WebM.
 - **Browser WebP support varies**: the browser build relies on Canvas/OffscreenCanvas WebP encoding support. When encoding isn’t available, the function can return the original input and set `isWebp: false`.
 - **Metadata**: EXIF/IPTC metadata is not preserved.
 - **Not a perfect “max bytes” guarantee**: `targetBytes` is a best-effort search within the provided quality range.
+- **Browser video memory guardrail**: `videoToWebm()` now enforces a default `maxInputBytes` limit (64 MiB) before ffmpeg.wasm processing to avoid hard crashes on constrained devices. You can override this via `video: { maxInputBytes: ... }`.
+
+## Troubleshooting video conversion
+
+- **Browser `RuntimeError: memory access out of bounds`**:
+  - Reduce source file size/resolution, trim duration, or lower bitrate.
+  - Set a stricter `maxDurationSeconds` and/or adjust `maxInputBytes` for your environment.
+  - Ensure ffmpeg.wasm assets can load (no CSP/CORS/asset-path issues).
+- **Node conversion fails with VP9 encoder errors**:
+  - The Node converter tries VP9 first and automatically falls back to VP8 when VP9 encoder support is missing.
+  - If both fail, check bundled ffmpeg capabilities and runtime stderr in the thrown error.
 
 ## Import paths
 

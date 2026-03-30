@@ -115,11 +115,34 @@ async function getFfmpeg(): Promise<FFmpeg> {
   if (ffmpegLoadPromise) return ffmpegLoadPromise
   const ff = new FFmpeg()
   ffmpegLoadPromise = (async () => {
-    await ff.load()
-    ffmpegSingleton = ff
-    return ff
+    try {
+      await ff.load()
+      ffmpegSingleton = ff
+      return ff
+    } catch (err) {
+      ffmpegLoadPromise = null
+      const detail = [
+        "Failed to initialize ffmpeg.wasm.",
+        `error=${toErrorMessage(err)}`,
+        "hint=Ensure ffmpeg core/worker assets are reachable by your bundler/runtime and not blocked by CSP/CORS.",
+      ].join("\n")
+      throw new Error(detail)
+    }
   })()
   return ffmpegLoadPromise
+}
+
+async function resetFfmpegRuntime(): Promise<void> {
+  const current = ffmpegSingleton
+  ffmpegSingleton = null
+  ffmpegLoadPromise = null
+  if (current && typeof (current as any).terminate === "function") {
+    try {
+      await (current as any).terminate()
+    } catch {
+      // Best-effort reset only.
+    }
+  }
 }
 
 async function runWithFfmpegLock<T>(job: () => Promise<T>): Promise<T> {
@@ -154,12 +177,27 @@ function formatArgs(args: string[]): string {
   return args.map((v) => (/\s/.test(v) ? `"${v}"` : v)).join(" ")
 }
 
+function isRecoverableWasmError(err: unknown): boolean {
+  const msg = toErrorMessage(err).toLowerCase()
+  return (
+    msg.includes("memory access out of bounds") ||
+    msg.includes("runtimeerror") ||
+    msg.includes("aborted") ||
+    msg.includes("wasm")
+  )
+}
+
 export type VideoToWebmInput = Blob | File | string
 
 export type VideoToWebmOptions = {
   crf?: number
   deadline?: "good" | "best" | "realtime"
   maxDurationSeconds?: number
+  /**
+   * Guardrail for browser wasm memory pressure.
+   * Throws before transcoding when input exceeds this limit.
+   */
+  maxInputBytes?: number
   fileName?: string
   returnFile?: boolean
 }
@@ -170,19 +208,30 @@ export type VideoToWebmResult = {
   isWebm: boolean
 }
 
-const VIDEO_DEFAULTS: Required<Pick<VideoToWebmOptions, "crf" | "deadline" | "returnFile">> = {
+const VIDEO_DEFAULTS: Required<Pick<VideoToWebmOptions, "crf" | "deadline" | "returnFile" | "maxInputBytes">> = {
   crf: 32,
   deadline: "good",
   returnFile: false,
+  maxInputBytes: 64 * 1024 * 1024,
 }
 
-export async function videoToWebm(
-  input: VideoToWebmInput,
-  options: VideoToWebmOptions = {}
-): Promise<VideoToWebmResult> {
-  const opts = { ...VIDEO_DEFAULTS, ...options }
-  const blob = await inputToBlob(input)
-  const ffmpeg = await getFfmpeg()
+function assertVideoInputGuardrails(blob: Blob, opts: Required<Pick<VideoToWebmOptions, "maxInputBytes">>) {
+  if (opts.maxInputBytes > 0 && blob.size > opts.maxInputBytes) {
+    throw new Error(
+      [
+        "videoToWebm guardrail: input too large for browser ffmpeg.wasm.",
+        `input_bytes=${blob.size}`,
+        `max_input_bytes=${opts.maxInputBytes}`,
+        "hint=Lower source resolution/bitrate, trim video, or increase maxInputBytes if your environment has enough memory.",
+      ].join("\n")
+    )
+  }
+}
+
+type NormalizedVideoOptions = Required<Pick<VideoToWebmOptions, "crf" | "deadline" | "returnFile" | "maxInputBytes">> &
+  Pick<VideoToWebmOptions, "maxDurationSeconds" | "fileName">
+
+async function runVideoTranscodeJob(ffmpeg: FFmpeg, blob: Blob, opts: NormalizedVideoOptions) {
   const jobId = createFsSafeId()
   const inName = `input-${jobId}`
   const outName = `output-${jobId}.webm`
@@ -241,7 +290,28 @@ export async function videoToWebm(
     }
   })
 
-  const outBlob = new Blob([outBytes], { type: "video/webm" })
+  return new Blob([outBytes], { type: "video/webm" })
+}
+
+export async function videoToWebm(
+  input: VideoToWebmInput,
+  options: VideoToWebmOptions = {}
+): Promise<VideoToWebmResult> {
+  const opts = { ...VIDEO_DEFAULTS, ...options }
+  const blob = await inputToBlob(input)
+  assertVideoInputGuardrails(blob, opts)
+
+  let outBlob: Blob
+  try {
+    const ffmpeg = await getFfmpeg()
+    outBlob = await runVideoTranscodeJob(ffmpeg, blob, opts)
+  } catch (err) {
+    if (!isRecoverableWasmError(err)) throw err
+    await resetFfmpegRuntime()
+    const ffmpeg = await getFfmpeg()
+    outBlob = await runVideoTranscodeJob(ffmpeg, blob, opts)
+  }
+
   const file = opts.returnFile ? new File([outBlob], defaultVideoName(input, opts.fileName), { type: outBlob.type }) : undefined
   return { blob: outBlob, file, isWebm: true }
 }
