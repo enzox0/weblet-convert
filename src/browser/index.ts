@@ -108,6 +108,7 @@ function defaultVideoName(input: Blob | File | string, fileName?: string) {
 
 let ffmpegSingleton: FFmpeg | null = null
 let ffmpegLoadPromise: Promise<FFmpeg> | null = null
+let ffmpegJobQueue: Promise<void> = Promise.resolve()
 
 async function getFfmpeg(): Promise<FFmpeg> {
   if (ffmpegSingleton) return ffmpegSingleton
@@ -119,6 +120,38 @@ async function getFfmpeg(): Promise<FFmpeg> {
     return ff
   })()
   return ffmpegLoadPromise
+}
+
+async function runWithFfmpegLock<T>(job: () => Promise<T>): Promise<T> {
+  const previous = ffmpegJobQueue
+  let release!: () => void
+  ffmpegJobQueue = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  await previous
+  try {
+    return await job()
+  } finally {
+    release()
+  }
+}
+
+function createFsSafeId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function toErrorMessage(err: unknown): string {
+  if (err instanceof Error && err.message) return err.message
+  if (typeof err === "string") return err
+  try {
+    return JSON.stringify(err)
+  } catch {
+    return String(err)
+  }
+}
+
+function formatArgs(args: string[]): string {
+  return args.map((v) => (/\s/.test(v) ? `"${v}"` : v)).join(" ")
 }
 
 export type VideoToWebmInput = Blob | File | string
@@ -150,38 +183,63 @@ export async function videoToWebm(
   const opts = { ...VIDEO_DEFAULTS, ...options }
   const blob = await inputToBlob(input)
   const ffmpeg = await getFfmpeg()
+  const jobId = createFsSafeId()
+  const inName = `input-${jobId}`
+  const outName = `output-${jobId}.webm`
 
-  const inName = "input"
-  const outName = "output.webm"
+  const outBytes = await runWithFfmpegLock(async () => {
+    await ffmpeg.writeFile(inName, await fetchFile(blob))
 
-  await ffmpeg.writeFile(inName, await fetchFile(blob))
+    const args: string[] = [
+      ...(opts.maxDurationSeconds && opts.maxDurationSeconds > 0 ? ["-t", String(opts.maxDurationSeconds)] : []),
+      "-i",
+      inName,
+      "-map",
+      "0:v:0",
+      "-map",
+      "0:a?",
+      "-c:v",
+      "libvpx-vp9",
+      "-b:v",
+      "0",
+      "-crf",
+      String(opts.crf),
+      "-deadline",
+      opts.deadline,
+      "-row-mt",
+      "1",
+      "-c:a",
+      "libopus",
+      outName,
+    ]
 
-  const args: string[] = [
-    ...(opts.maxDurationSeconds && opts.maxDurationSeconds > 0 ? ["-t", String(opts.maxDurationSeconds)] : []),
-    "-i",
-    inName,
-    "-map",
-    "0:v:0",
-    "-map",
-    "0:a?",
-    "-c:v",
-    "libvpx-vp9",
-    "-b:v",
-    "0",
-    "-crf",
-    String(opts.crf),
-    "-deadline",
-    opts.deadline,
-    "-row-mt",
-    "1",
-    "-c:a",
-    "libopus",
-    outName,
-  ]
+    const logs: string[] = []
+    const onLog = ({ message }: { message: string }) => {
+      if (typeof message !== "string" || message.length === 0) return
+      logs.push(message)
+      if (logs.length > 60) logs.shift()
+    }
 
-  await ffmpeg.exec(args)
-  const outData = await ffmpeg.readFile(outName)
-  const outBytes = outData instanceof Uint8Array ? outData : new Uint8Array(outData as any)
+    try {
+      ffmpeg.on("log", onLog)
+      await ffmpeg.exec(args)
+      const outData = await ffmpeg.readFile(outName)
+      return outData instanceof Uint8Array ? outData : new Uint8Array(outData as any)
+    } catch (err) {
+      const detail = [
+        `videoToWebm failed.`,
+        `input=${inName}`,
+        `output=${outName}`,
+        `args=${formatArgs(args)}`,
+        `error=${toErrorMessage(err)}`,
+        logs.length ? `ffmpeg_logs:\n${logs.join("\n")}` : "ffmpeg_logs: <none>",
+      ].join("\n")
+      throw new Error(detail)
+    } finally {
+      ffmpeg.off("log", onLog)
+      await Promise.allSettled([ffmpeg.deleteFile(inName), ffmpeg.deleteFile(outName)])
+    }
+  })
 
   const outBlob = new Blob([outBytes], { type: "video/webm" })
   const file = opts.returnFile ? new File([outBlob], defaultVideoName(input, opts.fileName), { type: outBlob.type }) : undefined
