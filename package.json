@@ -1,6 +1,6 @@
 {
   "name": "weblet-convert",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "description": "Convert images to WebP and videos to WebM in browser and Node.js.",
   "license": "MIT",
   "repository": {
