@@ -96,12 +96,48 @@ Notes:
 
 Transcodes videos to WebM.
 
+`video` options now support ffmpeg.wasm asset configuration in browser runtimes:
+
+- `ffmpeg.baseURL` (auto-derives core/wasm/worker URLs)
+- or explicit `ffmpeg.coreURL`, `ffmpeg.wasmURL`, `ffmpeg.workerURL`
+
+### `videoToWebmDebug(input, options?, onEvent?)` (Ultimate debug mode)
+
+Browser-only debug helper for diagnosing ffmpeg.wasm failures.
+
+- Returns `{ ok: true, ...result, events, diagnostic }` on success
+- Returns `{ ok: false, error, events, diagnostic }` on failure
+- Emits stage events like `init`, `transcode`, `retry-reset`, and `done`
+- `diagnostic` includes:
+  - `cause` (classified root-cause code, e.g. `ffmpeg-init-failed`, `input-too-large`)
+  - `stage` (where it failed)
+  - `rawError`
+  - `recoverable`
+  - `hints` (actionable fixes)
+
+Example:
+
+```ts
+import { videoToWebmDebug } from "@weblet/convert"
+
+const debug = await videoToWebmDebug(file, { maxInputBytes: 256 * 1024 * 1024 }, (e) => {
+  console.log(`[${e.stage}] ${e.message}`, e.detail ?? "")
+})
+
+if (!debug.ok) {
+  console.error("WebM conversion failed:", debug.error.message)
+  console.error("Cause:", debug.diagnostic.cause)
+  console.error("Hints:", debug.diagnostic.hints.join(" | "))
+}
+```
+
 ## Notes and limitations
 
 - **Browser WebP support varies**: the browser build relies on Canvas/OffscreenCanvas WebP encoding support. When encoding isn’t available, the function can return the original input and set `isWebp: false`.
 - **Metadata**: EXIF/IPTC metadata is not preserved.
 - **Not a perfect “max bytes” guarantee**: `targetBytes` is a best-effort search within the provided quality range.
-- **Browser video memory guardrail**: `videoToWebm()` now enforces a default `maxInputBytes` limit (64 MiB) before ffmpeg.wasm processing to avoid hard crashes on constrained devices. You can override this via `video: { maxInputBytes: ... }`.
+- **Browser video input limit**: by default there is **no input-size limit** (`maxInputBytes: 0`).  
+  If you want a safeguard in your app, set `video: { maxInputBytes: ... }` explicitly.
 
 ## Troubleshooting video conversion
 
@@ -115,7 +151,7 @@ Transcodes videos to WebM.
 
 ## Import paths
 
-- **Browser**: `import { convert, imageToWebp, videoToWebm } from "@weblet/convert"`
+- **Browser**: `import { convert, imageToWebp, videoToWebm, videoToWebmDebug } from "@weblet/convert"`
 - **Node**: `import { convert, imageToWebp, videoToWebm } from "weblet-convert/node"`
 
 ## Build (contributors)

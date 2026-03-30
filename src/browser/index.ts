@@ -109,14 +109,49 @@ function defaultVideoName(input: Blob | File | string, fileName?: string) {
 let ffmpegSingleton: FFmpeg | null = null
 let ffmpegLoadPromise: Promise<FFmpeg> | null = null
 let ffmpegJobQueue: Promise<void> = Promise.resolve()
+let ffmpegConfigKey = "{}"
 
-async function getFfmpeg(): Promise<FFmpeg> {
+function normalizeBrowserFfmpegLoadOptions(input?: BrowserFfmpegLoadOptions): BrowserFfmpegLoadOptions | undefined {
+  if (!input) return undefined
+  const baseURL = input.baseURL?.trim()
+  const normalize = (v?: string) => v?.trim() || undefined
+  const make = (suffix: string) => {
+    if (!baseURL) return undefined
+    return `${baseURL.replace(/\/+$/, "")}/${suffix}`
+  }
+  return {
+    baseURL,
+    coreURL: normalize(input.coreURL) ?? make("ffmpeg-core.js"),
+    wasmURL: normalize(input.wasmURL) ?? make("ffmpeg-core.wasm"),
+    workerURL: normalize(input.workerURL) ?? make("ffmpeg-core.worker.js"),
+  }
+}
+
+function getFfmpegConfigKey(input?: BrowserFfmpegLoadOptions): string {
+  return JSON.stringify(normalizeBrowserFfmpegLoadOptions(input) ?? {})
+}
+
+async function getFfmpeg(loadOptions?: BrowserFfmpegLoadOptions): Promise<FFmpeg> {
+  const nextKey = getFfmpegConfigKey(loadOptions)
+  if (nextKey !== ffmpegConfigKey) {
+    await resetFfmpegRuntime()
+    ffmpegConfigKey = nextKey
+  }
   if (ffmpegSingleton) return ffmpegSingleton
   if (ffmpegLoadPromise) return ffmpegLoadPromise
   const ff = new FFmpeg()
+  const normalized = normalizeBrowserFfmpegLoadOptions(loadOptions)
+  const loadParams =
+    normalized && (normalized.coreURL || normalized.wasmURL || normalized.workerURL)
+      ? {
+          ...(normalized.coreURL ? { coreURL: normalized.coreURL } : {}),
+          ...(normalized.wasmURL ? { wasmURL: normalized.wasmURL } : {}),
+          ...(normalized.workerURL ? { workerURL: normalized.workerURL } : {}),
+        }
+      : undefined
   ffmpegLoadPromise = (async () => {
     try {
-      await ff.load()
+      await ff.load(loadParams as any)
       ffmpegSingleton = ff
       return ff
     } catch (err) {
@@ -189,6 +224,17 @@ function isRecoverableWasmError(err: unknown): boolean {
 
 export type VideoToWebmInput = Blob | File | string
 
+export type BrowserFfmpegLoadOptions = {
+  /**
+   * Base URL where ffmpeg.wasm assets live.
+   * Missing specific URLs are derived from this.
+   */
+  baseURL?: string
+  coreURL?: string
+  wasmURL?: string
+  workerURL?: string
+}
+
 export type VideoToWebmOptions = {
   crf?: number
   deadline?: "good" | "best" | "realtime"
@@ -198,6 +244,10 @@ export type VideoToWebmOptions = {
    * Throws before transcoding when input exceeds this limit.
    */
   maxInputBytes?: number
+  /**
+   * Optional browser ffmpeg.wasm asset URL configuration.
+   */
+  ffmpeg?: BrowserFfmpegLoadOptions
   fileName?: string
   returnFile?: boolean
 }
@@ -208,11 +258,49 @@ export type VideoToWebmResult = {
   isWebm: boolean
 }
 
+export type VideoToWebmDebugStage =
+  | "input"
+  | "guardrail"
+  | "init"
+  | "transcode"
+  | "retry-reset"
+  | "retry-init"
+  | "retry-transcode"
+  | "done"
+
+export type VideoToWebmDebugEvent = {
+  stage: VideoToWebmDebugStage
+  message: string
+  detail?: string
+}
+
+export type VideoToWebmDebugCause =
+  | "none"
+  | "input-fetch-failed"
+  | "input-too-large"
+  | "ffmpeg-init-failed"
+  | "ffmpeg-transcode-failed"
+  | "ffmpeg-wasm-runtime-crash"
+  | "unsupported-input"
+  | "unknown"
+
+export type VideoToWebmDiagnostic = {
+  cause: VideoToWebmDebugCause
+  stage: VideoToWebmDebugStage
+  rawError?: string
+  recoverable: boolean
+  hints: string[]
+}
+
+export type VideoToWebmDebugResult =
+  | ({ ok: true } & VideoToWebmResult & { events: VideoToWebmDebugEvent[]; diagnostic: VideoToWebmDiagnostic })
+  | { ok: false; error: Error; events: VideoToWebmDebugEvent[]; diagnostic: VideoToWebmDiagnostic }
+
 const VIDEO_DEFAULTS: Required<Pick<VideoToWebmOptions, "crf" | "deadline" | "returnFile" | "maxInputBytes">> = {
   crf: 32,
   deadline: "good",
   returnFile: false,
-  maxInputBytes: 64 * 1024 * 1024,
+  maxInputBytes: 0,
 }
 
 function assertVideoInputGuardrails(blob: Blob, opts: Required<Pick<VideoToWebmOptions, "maxInputBytes">>) {
@@ -229,7 +317,84 @@ function assertVideoInputGuardrails(blob: Blob, opts: Required<Pick<VideoToWebmO
 }
 
 type NormalizedVideoOptions = Required<Pick<VideoToWebmOptions, "crf" | "deadline" | "returnFile" | "maxInputBytes">> &
-  Pick<VideoToWebmOptions, "maxDurationSeconds" | "fileName">
+  Pick<VideoToWebmOptions, "maxDurationSeconds" | "fileName" | "ffmpeg">
+
+function buildVideoDiagnostic(stage: VideoToWebmDebugStage, err: unknown): VideoToWebmDiagnostic {
+  const raw = toErrorMessage(err)
+  const lower = raw.toLowerCase()
+  const recoverable = isRecoverableWasmError(err)
+
+  if (lower.includes("failed to fetch")) {
+    return {
+      cause: "input-fetch-failed",
+      stage,
+      rawError: raw,
+      recoverable: false,
+      hints: ["Verify URL reachability and CORS policy for browser fetch."],
+    }
+  }
+
+  if (lower.includes("input too large") || lower.includes("max_input_bytes")) {
+    return {
+      cause: "input-too-large",
+      stage,
+      rawError: raw,
+      recoverable: false,
+      hints: ["Increase maxInputBytes or reduce source size/resolution/duration."],
+    }
+  }
+
+  if (lower.includes("failed to initialize ffmpeg.wasm")) {
+    return {
+      cause: "ffmpeg-init-failed",
+      stage,
+      rawError: raw,
+      recoverable,
+      hints: [
+        "Provide video.ffmpeg.baseURL or explicit coreURL/wasmURL/workerURL.",
+        "Ensure CSP/CORS allows ffmpeg worker + wasm assets.",
+      ],
+    }
+  }
+
+  if (lower.includes("memory access out of bounds") || lower.includes("runtimeerror") || lower.includes("aborted")) {
+    return {
+      cause: "ffmpeg-wasm-runtime-crash",
+      stage,
+      rawError: raw,
+      recoverable: true,
+      hints: ["Reduce workload: trim duration, lower resolution/bitrate, or split video."],
+    }
+  }
+
+  if (lower.includes("videotowebm failed")) {
+    return {
+      cause: "ffmpeg-transcode-failed",
+      stage,
+      rawError: raw,
+      recoverable,
+      hints: ["Inspect ffmpeg_logs in rawError for codec/container-specific details."],
+    }
+  }
+
+  if (lower.includes("unsupported input type")) {
+    return {
+      cause: "unsupported-input",
+      stage,
+      rawError: raw,
+      recoverable: false,
+      hints: ["Use a valid image/* or video/* input and ensure proper MIME/magic bytes."],
+    }
+  }
+
+  return {
+    cause: "unknown",
+    stage,
+    rawError: raw,
+    recoverable,
+    hints: ["Use videoToWebmDebug() output to trace failing stage and share rawError."],
+  }
+}
 
 async function runVideoTranscodeJob(ffmpeg: FFmpeg, blob: Blob, opts: NormalizedVideoOptions) {
   const jobId = createFsSafeId()
@@ -303,17 +468,88 @@ export async function videoToWebm(
 
   let outBlob: Blob
   try {
-    const ffmpeg = await getFfmpeg()
+    const ffmpeg = await getFfmpeg(opts.ffmpeg)
     outBlob = await runVideoTranscodeJob(ffmpeg, blob, opts)
   } catch (err) {
     if (!isRecoverableWasmError(err)) throw err
     await resetFfmpegRuntime()
-    const ffmpeg = await getFfmpeg()
+    const ffmpeg = await getFfmpeg(opts.ffmpeg)
     outBlob = await runVideoTranscodeJob(ffmpeg, blob, opts)
   }
 
   const file = opts.returnFile ? new File([outBlob], defaultVideoName(input, opts.fileName), { type: outBlob.type }) : undefined
   return { blob: outBlob, file, isWebm: true }
+}
+
+export async function videoToWebmDebug(
+  input: VideoToWebmInput,
+  options: VideoToWebmOptions = {},
+  onEvent?: (event: VideoToWebmDebugEvent) => void
+): Promise<VideoToWebmDebugResult> {
+  const events: VideoToWebmDebugEvent[] = []
+  let lastStage: VideoToWebmDebugStage = "input"
+  const emit = (event: VideoToWebmDebugEvent) => {
+    lastStage = event.stage
+    events.push(event)
+    onEvent?.(event)
+  }
+
+  try {
+    emit({ stage: "input", message: "Reading input as Blob." })
+    const opts = { ...VIDEO_DEFAULTS, ...options }
+    const blob = await inputToBlob(input)
+
+    emit({
+      stage: "guardrail",
+      message: "Checking browser ffmpeg.wasm memory guardrail.",
+      detail: `input_bytes=${blob.size};max_input_bytes=${opts.maxInputBytes}`,
+    })
+    assertVideoInputGuardrails(blob, opts)
+
+    let outBlob: Blob
+    try {
+      emit({ stage: "init", message: "Initializing ffmpeg.wasm runtime." })
+      const ffmpeg = await getFfmpeg(opts.ffmpeg)
+      emit({ stage: "transcode", message: "Running video transcode job (VP9 + Opus)." })
+      outBlob = await runVideoTranscodeJob(ffmpeg, blob, opts)
+    } catch (err) {
+      if (!isRecoverableWasmError(err)) throw err
+      emit({
+        stage: "retry-reset",
+        message: "Recoverable wasm error detected, resetting runtime.",
+        detail: toErrorMessage(err),
+      })
+      await resetFfmpegRuntime()
+      emit({ stage: "retry-init", message: "Reinitializing ffmpeg.wasm runtime." })
+      const ffmpeg = await getFfmpeg(opts.ffmpeg)
+      emit({ stage: "retry-transcode", message: "Retrying video transcode job." })
+      outBlob = await runVideoTranscodeJob(ffmpeg, blob, opts)
+    }
+
+    const file = opts.returnFile ? new File([outBlob], defaultVideoName(input, opts.fileName), { type: outBlob.type }) : undefined
+    emit({
+      stage: "done",
+      message: "Video converted to WebM.",
+      detail: `output_bytes=${outBlob.size};mime=${outBlob.type}`,
+    })
+    return {
+      ok: true,
+      blob: outBlob,
+      file,
+      isWebm: true,
+      events,
+      diagnostic: { cause: "none", stage: "done", recoverable: false, hints: [] },
+    }
+  } catch (err) {
+    const error = err instanceof Error ? err : new Error(toErrorMessage(err))
+    const diagnostic = buildVideoDiagnostic(lastStage, error)
+    emit({
+      stage: "done",
+      message: "Video conversion failed.",
+      detail: `cause=${diagnostic.cause};${error.message}`,
+    })
+    return { ok: false, error, events, diagnostic }
+  }
 }
 
 export type ConvertInput = ImageToWebpInput
