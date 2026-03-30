@@ -100,6 +100,8 @@ Transcodes videos to WebM.
 
 - `ffmpeg.baseURL` (auto-derives core/wasm/worker URLs)
 - or explicit `ffmpeg.coreURL`, `ffmpeg.wasmURL`, `ffmpeg.workerURL`
+- `enableLowMemoryFallback` (default `true`) retries with reduced memory profile
+- `fallbackMaxWidth` (default `960`) output width cap used by fallback
 
 ### `videoToWebmDebug(input, options?, onEvent?)` (Ultimate debug mode)
 

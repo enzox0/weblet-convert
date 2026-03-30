@@ -245,6 +245,14 @@ export type VideoToWebmOptions = {
    */
   maxInputBytes?: number
   /**
+   * On recoverable wasm crashes, retry with lower-memory ffmpeg args.
+   */
+  enableLowMemoryFallback?: boolean
+  /**
+   * Max output width used by low-memory fallback.
+   */
+  fallbackMaxWidth?: number
+  /**
    * Optional browser ffmpeg.wasm asset URL configuration.
    */
   ffmpeg?: BrowserFfmpegLoadOptions
@@ -296,11 +304,18 @@ export type VideoToWebmDebugResult =
   | ({ ok: true } & VideoToWebmResult & { events: VideoToWebmDebugEvent[]; diagnostic: VideoToWebmDiagnostic })
   | { ok: false; error: Error; events: VideoToWebmDebugEvent[]; diagnostic: VideoToWebmDiagnostic }
 
-const VIDEO_DEFAULTS: Required<Pick<VideoToWebmOptions, "crf" | "deadline" | "returnFile" | "maxInputBytes">> = {
+const VIDEO_DEFAULTS: Required<
+  Pick<
+    VideoToWebmOptions,
+    "crf" | "deadline" | "returnFile" | "maxInputBytes" | "enableLowMemoryFallback" | "fallbackMaxWidth"
+  >
+> = {
   crf: 32,
   deadline: "good",
   returnFile: false,
   maxInputBytes: 0,
+  enableLowMemoryFallback: true,
+  fallbackMaxWidth: 960,
 }
 
 function assertVideoInputGuardrails(blob: Blob, opts: Required<Pick<VideoToWebmOptions, "maxInputBytes">>) {
@@ -316,7 +331,12 @@ function assertVideoInputGuardrails(blob: Blob, opts: Required<Pick<VideoToWebmO
   }
 }
 
-type NormalizedVideoOptions = Required<Pick<VideoToWebmOptions, "crf" | "deadline" | "returnFile" | "maxInputBytes">> &
+type NormalizedVideoOptions = Required<
+  Pick<
+    VideoToWebmOptions,
+    "crf" | "deadline" | "returnFile" | "maxInputBytes" | "enableLowMemoryFallback" | "fallbackMaxWidth"
+  >
+> &
   Pick<VideoToWebmOptions, "maxDurationSeconds" | "fileName" | "ffmpeg">
 
 function buildVideoDiagnostic(stage: VideoToWebmDebugStage, err: unknown): VideoToWebmDiagnostic {
@@ -458,6 +478,73 @@ async function runVideoTranscodeJob(ffmpeg: FFmpeg, blob: Blob, opts: Normalized
   return new Blob([outBytes], { type: "video/webm" })
 }
 
+async function runVideoTranscodeLowMemoryJob(ffmpeg: FFmpeg, blob: Blob, opts: NormalizedVideoOptions) {
+  const jobId = createFsSafeId()
+  const inName = `input-${jobId}`
+  const outName = `output-${jobId}.webm`
+  const safeWidth = Math.max(320, Math.round(opts.fallbackMaxWidth))
+
+  const outBytes = await runWithFfmpegLock(async () => {
+    await ffmpeg.writeFile(inName, await fetchFile(blob))
+
+    const args: string[] = [
+      ...(opts.maxDurationSeconds && opts.maxDurationSeconds > 0 ? ["-t", String(opts.maxDurationSeconds)] : []),
+      "-i",
+      inName,
+      "-map",
+      "0:v:0",
+      "-map",
+      "0:a?",
+      "-vf",
+      `scale='min(${safeWidth},iw)':-2:flags=bilinear`,
+      "-c:v",
+      "libvpx-vp9",
+      "-b:v",
+      "0",
+      "-crf",
+      String(Math.max(34, opts.crf)),
+      "-deadline",
+      "realtime",
+      "-cpu-used",
+      "8",
+      "-row-mt",
+      "1",
+      "-c:a",
+      "libopus",
+      outName,
+    ]
+
+    const logs: string[] = []
+    const onLog = ({ message }: { message: string }) => {
+      if (typeof message !== "string" || message.length === 0) return
+      logs.push(message)
+      if (logs.length > 60) logs.shift()
+    }
+
+    try {
+      ffmpeg.on("log", onLog)
+      await ffmpeg.exec(args)
+      const outData = await ffmpeg.readFile(outName)
+      return outData instanceof Uint8Array ? outData : new Uint8Array(outData as any)
+    } catch (err) {
+      const detail = [
+        `videoToWebm low-memory fallback failed.`,
+        `input=${inName}`,
+        `output=${outName}`,
+        `args=${formatArgs(args)}`,
+        `error=${toErrorMessage(err)}`,
+        logs.length ? `ffmpeg_logs:\n${logs.join("\n")}` : "ffmpeg_logs: <none>",
+      ].join("\n")
+      throw new Error(detail)
+    } finally {
+      ffmpeg.off("log", onLog)
+      await Promise.allSettled([ffmpeg.deleteFile(inName), ffmpeg.deleteFile(outName)])
+    }
+  })
+
+  return new Blob([outBytes], { type: "video/webm" })
+}
+
 export async function videoToWebm(
   input: VideoToWebmInput,
   options: VideoToWebmOptions = {}
@@ -474,7 +561,14 @@ export async function videoToWebm(
     if (!isRecoverableWasmError(err)) throw err
     await resetFfmpegRuntime()
     const ffmpeg = await getFfmpeg(opts.ffmpeg)
-    outBlob = await runVideoTranscodeJob(ffmpeg, blob, opts)
+    try {
+      outBlob = await runVideoTranscodeJob(ffmpeg, blob, opts)
+    } catch (retryErr) {
+      if (!isRecoverableWasmError(retryErr) || !opts.enableLowMemoryFallback) throw retryErr
+      await resetFfmpegRuntime()
+      const ffmpegFallback = await getFfmpeg(opts.ffmpeg)
+      outBlob = await runVideoTranscodeLowMemoryJob(ffmpegFallback, blob, opts)
+    }
   }
 
   const file = opts.returnFile ? new File([outBlob], defaultVideoName(input, opts.fileName), { type: outBlob.type }) : undefined
@@ -523,7 +617,19 @@ export async function videoToWebmDebug(
       emit({ stage: "retry-init", message: "Reinitializing ffmpeg.wasm runtime." })
       const ffmpeg = await getFfmpeg(opts.ffmpeg)
       emit({ stage: "retry-transcode", message: "Retrying video transcode job." })
-      outBlob = await runVideoTranscodeJob(ffmpeg, blob, opts)
+      try {
+        outBlob = await runVideoTranscodeJob(ffmpeg, blob, opts)
+      } catch (retryErr) {
+        if (!isRecoverableWasmError(retryErr) || !opts.enableLowMemoryFallback) throw retryErr
+        emit({
+          stage: "retry-transcode",
+          message: "Running low-memory fallback transcode profile.",
+          detail: `fallback_max_width=${opts.fallbackMaxWidth}`,
+        })
+        await resetFfmpegRuntime()
+        const ffmpegFallback = await getFfmpeg(opts.ffmpeg)
+        outBlob = await runVideoTranscodeLowMemoryJob(ffmpegFallback, blob, opts)
+      }
     }
 
     const file = opts.returnFile ? new File([outBlob], defaultVideoName(input, opts.fileName), { type: outBlob.type }) : undefined
